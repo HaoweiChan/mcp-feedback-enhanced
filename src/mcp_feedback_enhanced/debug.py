@@ -77,3 +77,20 @@ def is_debug_enabled() -> bool:
 def set_debug_mode(enabled: bool) -> None:
     """設置調試模式（用於測試）"""
     os.environ["MCP_DEBUG"] = "true" if enabled else "false"
+
+
+def port_info_log(port: int, host: str) -> None:
+    """Always print the chosen Web UI port to stderr so MCP clients can discover it.
+
+    Unlike debug_log, this is NOT gated by MCP_DEBUG — it emits one line per
+    server startup so users (and Cursor's MCP Log) always know which port to open.
+    """
+    try:
+        print(
+            f"[mcp-feedback-enhanced] Web UI started on port {port} "
+            f"(http://{host}:{port})",
+            file=sys.stderr,
+            flush=True,
+        )
+    except Exception:
+        pass

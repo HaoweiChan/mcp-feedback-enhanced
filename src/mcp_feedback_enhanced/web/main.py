@@ -22,7 +22,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from ..debug import web_debug_log as debug_log
+from ..debug import port_info_log, web_debug_log as debug_log
 from ..utils.error_handler import ErrorHandler, ErrorType
 from ..utils.memory_monitor import get_memory_monitor
 from .models import CleanupReason, SessionStatus, WebFeedbackSession
@@ -609,6 +609,10 @@ class WebUIManager:
 
         # 等待伺服器啟動
         time.sleep(2)
+
+        # Always emit the active port to stderr so MCP clients can discover it
+        # without needing MCP_DEBUG=true (mirrors the wrapper-script behaviour).
+        port_info_log(self.port, self.host)
 
     def open_browser(self, url: str):
         """開啟瀏覽器"""

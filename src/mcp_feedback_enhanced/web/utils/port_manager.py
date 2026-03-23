@@ -7,6 +7,7 @@
 - 端口衝突解決
 """
 
+import os
 import socket
 import time
 from typing import Any
@@ -215,34 +216,34 @@ class PortManager:
     @staticmethod
     def _should_cleanup_process(process_info: dict[str, Any]) -> bool:
         """
-        判斷是否應該清理指定進程
+        判斷是否應該清理指定進程。
 
-        Args:
-            process_info: 進程信息字典
-
-        Returns:
-            bool: 是否應該清理該進程
+        Only clean up processes that appear to be stale/zombie. Never kill
+        an active mcp-feedback-enhanced server — a second instance should
+        just pick a different port instead.
         """
-        # 檢查是否是 MCP Feedback Enhanced 相關進程
+        pid = process_info.get("pid")
         cmdline = process_info.get("cmdline", "").lower()
-        process_name = process_info.get("name", "").lower()
 
-        # 如果是自己的進程，允許清理
+        # Never kill our own process
+        if pid == os.getpid():
+            debug_log("目標進程是自身，跳過清理")
+            return False
+
+        # Never kill a running mcp-feedback-enhanced server; just use
+        # another port so both instances can coexist.
         if any(
             keyword in cmdline
             for keyword in ["mcp-feedback-enhanced", "mcp_feedback_enhanced"]
         ):
-            return True
+            debug_log(
+                f"進程 PID {pid} 是活躍的 MCP Feedback Enhanced 實例，跳過清理，將使用其他端口"
+            )
+            return False
 
-        # 如果是 Python 進程且命令行包含相關關鍵字
-        if "python" in process_name and any(
-            keyword in cmdline for keyword in ["uvicorn", "fastapi"]
-        ):
-            return True
-
-        # 其他情況下，為了安全起見，不自動清理
+        # Don't auto-kill arbitrary processes
         debug_log(
-            f"進程 {process_info['name']} (PID: {process_info['pid']}) 不是 MCP 相關進程，跳過自動清理"
+            f"進程 {process_info['name']} (PID: {pid}) 不是 MCP 相關進程，跳過自動清理"
         )
         return False
 

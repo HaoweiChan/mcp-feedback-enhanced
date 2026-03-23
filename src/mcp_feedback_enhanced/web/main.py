@@ -71,8 +71,9 @@ class WebUIManager:
         else:
             debug_log(f"未設定 MCP_WEB_PORT 環境變數，使用預設端口 {preferred_port}")
 
-        # 使用增強的端口管理，測試模式下禁用自動清理避免權限問題
-        auto_cleanup = os.environ.get("MCP_TEST_MODE", "").lower() != "true"
+        # Disable auto-cleanup by default: never kill other mcp-feedback-enhanced
+        # processes. Each instance should pick its own port and coexist.
+        auto_cleanup = False
 
         if port is not None:
             # 如果明確指定了端口，使用指定的端口

@@ -614,6 +614,69 @@ def setup_routes(manager: "WebUIManager"):
                 },
             )
 
+    @manager.app.post("/api/telegram-feedback")
+    async def telegram_feedback(request: Request):
+        """處理通過 Telegram 收到的反饋"""
+
+        try:
+            data = await request.json()
+            feedback = data.get("feedback", "")
+            chat_id = data.get("chat_id", "")
+
+            if not feedback:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "status": "error",
+                        "message": "Feedback is required",
+                    },
+                )
+
+            # 驗證 chat_id
+            if manager.telegram_service:
+                admin_chat_id = manager.telegram_service.admin_chat_id
+                if admin_chat_id and str(chat_id) != str(admin_chat_id):
+                    debug_log(
+                        f"Telegram 反饋驗證失敗: chat_id={chat_id}, expected={admin_chat_id}"
+                    )
+                    return JSONResponse(
+                        status_code=403,
+                        content={
+                            "status": "error",
+                            "message": "Unauthorized",
+                        },
+                    )
+
+            # 提交反饋到當前會話
+            success = await manager.submit_telegram_feedback(feedback)
+            if success:
+                debug_log("Telegram 反饋提交成功")
+                return JSONResponse(
+                    content={
+                        "status": "success",
+                        "message": "Feedback submitted",
+                    },
+                )
+            else:
+                debug_log("Telegram 反饋提交失敗：沒有活躍會話")
+                return JSONResponse(
+                    status_code=404,
+                    content={
+                        "status": "error",
+                        "message": "No active session",
+                    },
+                )
+
+        except Exception as e:
+            debug_log(f"Telegram 反饋處理失敗: {e}")
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "status": "error",
+                    "message": f"Failed to process feedback: {e!s}",
+                },
+            )
+
 
 async def handle_websocket_message(manager: "WebUIManager", session, data: dict):
     """處理 WebSocket 消息"""

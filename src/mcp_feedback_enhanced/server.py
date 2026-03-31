@@ -23,6 +23,7 @@ MCP Feedback Enhanced 伺服器主要模組
 重構: 模塊化設計
 """
 
+import asyncio
 import base64
 import io
 import json
@@ -31,17 +32,11 @@ import sys
 from typing import Annotated, Any
 
 from fastmcp import FastMCP
-from mcp.types import TextContent, ImageContent
+from mcp.types import ImageContent, TextContent
 from pydantic import Field
 
-# 導入統一的調試功能
 from .debug import server_debug_log as debug_log
-
-# 導入多語系支援
-# 導入錯誤處理框架
 from .utils.error_handler import ErrorHandler, ErrorType
-
-# 導入資源管理器
 from .utils.resource_manager import create_temp_file
 
 
@@ -409,9 +404,7 @@ def process_images(images_data: list[dict]) -> list[ImageContent]:
 
             # 創建標準 MCP ImageContent 對象
             image_content = ImageContent(
-                type="image",
-                data=image_base64,
-                mimeType=mime_type
+                type="image", data=image_base64, mimeType=mime_type
             )
             image_contents.append(image_content)
 
@@ -471,6 +464,25 @@ async def interactive_feedback(
 
         # 使用 Web 模式
         debug_log("回饋模式: web")
+
+        # 發送 Telegram 通知（在等待反饋之前）
+        try:
+            from .services import TelegramServiceManager
+
+            telegram_manager = await TelegramServiceManager.get_instance()
+            if telegram_manager.is_enabled:
+                # 啟動 Telegram 服務（如果尚未啟動）
+                service = await telegram_manager.start_service()
+                if service:
+                    # 發送反饋請求通知
+                    debug_log("發送 Telegram 反饋請求通知")
+                    asyncio.create_task(
+                        service.send_feedback_request(
+                            project_directory, summary, timeout
+                        )
+                    )
+        except Exception as e:
+            debug_log(f"Telegram 通知發送失敗: {e}")
 
         result = await launch_web_feedback_ui(project_directory, summary, timeout)
 

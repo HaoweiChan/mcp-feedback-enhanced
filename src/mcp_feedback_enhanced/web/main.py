@@ -30,6 +30,7 @@ from .routes import setup_routes
 from .utils import get_browser_opener
 from .utils.compression_config import get_compression_manager
 from .utils.port_manager import PortManager
+from ..services.telegram_service import TelegramService, TelegramServiceManager
 
 
 class WebUIManager:
@@ -135,6 +136,9 @@ class WebUIManager:
         self.server_thread: threading.Thread | None = None
         self.server_process = None
         self.desktop_app_instance: Any = None  # 桌面應用實例引用
+
+        # Telegram 服務引用
+        self.telegram_service: TelegramService | None = None
 
         # 初始化標記，用於追蹤異步初始化狀態
         self._initialization_complete = False
@@ -738,6 +742,51 @@ class WebUIManager:
                 debug_log(f"關閉桌面應用程式失敗: {e}")
         else:
             debug_log("沒有活躍的桌面應用程式實例")
+
+    async def init_telegram_service(self) -> bool:
+        """初始化 Telegram 服務"""
+        try:
+            telegram_manager = await TelegramServiceManager.get_instance()
+            if not telegram_manager.is_enabled:
+                debug_log("Telegram 功能未啟用")
+                return False
+
+            if self.telegram_service is not None:
+                debug_log("Telegram 服務已初始化")
+                return True
+
+            async def on_feedback_received(feedback: str):
+                """當從 Telegram 收到反饋時的回調"""
+                session = self.get_current_session()
+                if session:
+                    debug_log(f"通過 Telegram 收到反饋: {feedback[:50]}...")
+                    await session.submit_feedback(feedback, [], {})
+                else:
+                    debug_log("收到 Telegram 反饋，但沒有活躍的會話")
+
+            self.telegram_service = await telegram_manager.start_service(
+                on_feedback_received=on_feedback_received
+            )
+            debug_log("Telegram 服務初始化成功")
+            return True
+        except Exception as e:
+            debug_log(f"Telegram 服務初始化失敗: {e}")
+            return False
+
+    async def submit_telegram_feedback(self, feedback: str) -> bool:
+        """提交通過 Telegram 收到的反饋"""
+        try:
+            session = self.get_current_session()
+            if not session:
+                debug_log("沒有活躍的會話，無法提交 Telegram 反饋")
+                return False
+
+            await session.submit_feedback(feedback, [], {})
+            debug_log("Telegram 反饋提交成功")
+            return True
+        except Exception as e:
+            debug_log(f"Telegram 反饋提交失敗: {e}")
+            return False
 
     async def _safe_close_websocket(self, websocket):
         """安全關閉 WebSocket 連接，避免事件循環衝突 - 僅在連接已轉移後調用"""

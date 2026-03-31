@@ -249,6 +249,18 @@
                         // 12. 初始化自動提交管理器
                         self.initializeAutoSubmitManager();
 
+                        // 13. 初始化佇列管理器
+                        self.queueManager = new window.MCPFeedback.QueueManager({
+                            onSubmitFeedback: function(text) {
+                                const input = document.getElementById('combinedFeedbackText');
+                                if (input) {
+                                    input.value = text;
+                                }
+                                self.submitFeedback();
+                            },
+                        });
+                        self.setupQueueUI();
+
                         // 13. 初始化 Textarea 高度管理器
                         self.initializeTextareaHeightManager();
 
@@ -1065,13 +1077,152 @@
                 const self = this;
                 setTimeout(function() {
                     self.checkAndStartAutoSubmit();
+                    
+                    // Trigger queued command if applicable
+                    if (self.queueManager) {
+                        self.queueManager.popAndSubmitIfReady();
+                    }
                 }, 100);
+                
+                // 啟動 Agent Timeout 倒數計時器
+                this.startAgentTimeoutCountdown(statusInfo);
                 break;
             case 'completed':
                 const completedMessage = window.i18nManager ? window.i18nManager.t('feedback.completed') : '會話已完成';
                 this.updateSummaryStatus(completedMessage);
+                this.stopAgentTimeoutCountdown();
                 break;
         }
+    };
+
+    /**
+     * Agent Timeout Countdown functions
+     */
+    FeedbackApp.prototype.startAgentTimeoutCountdown = function(statusInfo) {
+        this.stopAgentTimeoutCountdown(); // 停止舊的
+        
+        const agentTimeout = statusInfo.agent_timeout;
+        const createdAt = statusInfo.created_at || Date.now() / 1000;
+        
+        const displayElement = document.getElementById('agentTimeoutDisplay');
+        const timerElement = document.getElementById('agentTimeoutTimer');
+        
+        if (!agentTimeout || agentTimeout <= 0 || !displayElement || !timerElement) {
+            if (displayElement) displayElement.style.display = 'none';
+            return;
+        }
+        
+        displayElement.style.display = '';
+        
+        const self = this;
+        this.agentTimeoutInterval = setInterval(function() {
+            const now = Date.now() / 1000;
+            const elapsed = Math.max(0, now - createdAt);
+            const remaining = Math.max(0, agentTimeout - elapsed);
+            
+            const minutes = Math.floor(remaining / 60);
+            const seconds = Math.floor(remaining % 60);
+            timerElement.textContent = minutes.toString().padStart(2, '0') + ':' + seconds.toString().padStart(2, '0');
+            
+            if (remaining < 60) {
+                displayElement.classList.add('countdown-warning');
+            } else {
+                displayElement.classList.remove('countdown-warning');
+            }
+            
+            if (remaining <= 0) {
+                self.stopAgentTimeoutCountdown();
+                timerElement.textContent = "00:00";
+            }
+        }, 1000);
+    };
+
+    FeedbackApp.prototype.stopAgentTimeoutCountdown = function() {
+        if (this.agentTimeoutInterval) {
+            clearInterval(this.agentTimeoutInterval);
+            this.agentTimeoutInterval = null;
+        }
+        const displayElement = document.getElementById('agentTimeoutDisplay');
+        if (displayElement) {
+            displayElement.style.display = 'none';
+            displayElement.classList.remove('countdown-warning');
+        }
+    };
+
+    /**
+     * Setup Queue UI
+     */
+    FeedbackApp.prototype.setupQueueUI = function() {
+        if (!this.queueManager) return;
+        
+        const queueInput = document.getElementById('queueInput');
+        const addToQueueBtn = document.getElementById('addToQueueBtn');
+        const queueListContainer = document.getElementById('queueListContainer');
+        const self = this;
+        
+        function renderQueue() {
+            if (!queueListContainer) return;
+            queueListContainer.innerHTML = '';
+            
+            const queue = self.queueManager.getQueue();
+            if (queue.length === 0) {
+                queueListContainer.innerHTML = '<div style="color: var(--text-muted); font-size: 0.9em; padding: 8px 0;">佇列為空，收到 Agent 請求時將等待手動輸入。</div>';
+                return;
+            }
+            
+            queue.forEach((item, index) => {
+                const el = document.createElement('div');
+                el.style.display = 'flex';
+                el.style.justifyContent = 'space-between';
+                el.style.alignItems = 'center';
+                el.style.padding = '8px';
+                el.style.marginBottom = '4px';
+                el.style.background = 'var(--bg-secondary)';
+                el.style.borderRadius = '4px';
+                el.style.border = '1px solid var(--border-color)';
+                
+                const textNode = document.createElement('div');
+                textNode.style.overflow = 'hidden';
+                textNode.style.textOverflow = 'ellipsis';
+                textNode.style.whiteSpace = 'nowrap';
+                textNode.style.flex = '1';
+                textNode.textContent = `${index + 1}. ${item.text}`;
+                
+                const deleteBtn = document.createElement('button');
+                deleteBtn.className = 'btn-icon';
+                deleteBtn.innerHTML = '❌';
+                deleteBtn.style.marginLeft = '8px';
+                deleteBtn.onclick = () => {
+                    self.queueManager.removeItem(item.id);
+                    renderQueue();
+                };
+                
+                el.appendChild(textNode);
+                el.appendChild(deleteBtn);
+                queueListContainer.appendChild(el);
+            });
+        }
+        
+        if (addToQueueBtn && queueInput) {
+            addToQueueBtn.addEventListener('click', () => {
+                if (queueInput.value.trim()) {
+                    self.queueManager.enqueue(queueInput.value);
+                    queueInput.value = '';
+                    renderQueue();
+                }
+            });
+            queueInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    if (queueInput.value.trim()) {
+                        self.queueManager.enqueue(queueInput.value);
+                        queueInput.value = '';
+                        renderQueue();
+                    }
+                }
+            });
+        }
+        
+        renderQueue();
     };
 
     /**

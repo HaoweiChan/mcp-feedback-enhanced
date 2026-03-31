@@ -126,10 +126,12 @@ class WebFeedbackSession:
         summary: str,
         auto_cleanup_delay: int = 3600,
         max_idle_time: int = 1800,
+        agent_timeout: int = 600,
     ):
         self.session_id = session_id
         self.project_directory = project_directory
         self.summary = summary
+        self.agent_timeout = agent_timeout
         self.websocket: WebSocket | None = None
         self.feedback_result: str | None = None
         self.images: list[dict] = []
@@ -294,6 +296,7 @@ class WebFeedbackSession:
             "project_directory": self.project_directory,
             "summary": self.summary,
             "session_id": self.session_id,
+            "agent_timeout": self.agent_timeout,
         }
 
     def is_active(self) -> bool:

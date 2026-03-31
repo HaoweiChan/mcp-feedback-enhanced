@@ -174,6 +174,8 @@ def setup_routes(manager: "WebUIManager"):
                 "feedback_completed": current_session.feedback_completed.is_set(),
                 "command_logs": current_session.command_logs,
                 "images_count": len(current_session.images),
+                "created_at": int(current_session.created_at * 1000),
+                "agent_timeout": current_session.agent_timeout,
             }
         )
 
@@ -198,6 +200,7 @@ def setup_routes(manager: "WebUIManager"):
                     "has_websocket": session.websocket is not None,
                     "is_current": session == manager.current_session,
                     "user_messages": session.user_messages,  # 包含用戶消息記錄
+                    "agent_timeout": session.agent_timeout,
                 }
                 sessions_data.append(session_info)
 

@@ -1,20 +1,37 @@
+"""
+Telegram notification service using aiohttp directly.
+
+Avoids python-telegram-bot's lifecycle conflicts when embedded in
+an existing asyncio event loop (e.g. FastMCP). All API calls are
+plain HTTP requests via aiohttp which is already a project dependency.
+"""
+
 import asyncio
+import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Any
+import inspect
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    MessageHandler,
-    filters,
-)
+import aiohttp
 
 
-BOT_STARTED = False
+TG_API = "https://api.telegram.org/bot{token}/{method}"
+
+FEEDBACK_BUTTONS = {
+    "inline_keyboard": [
+        [
+            {"text": "👍 Continue", "callback_data": "feedback:continue"},
+            {"text": "⏭️ Skip", "callback_data": "feedback:skip"},
+        ],
+        [
+            {"text": "🔁 Retry", "callback_data": "feedback:retry"},
+            {"text": "✋ Wait", "callback_data": "feedback:wait"},
+        ],
+    ]
+}
 
 
 @dataclass
@@ -91,20 +108,6 @@ class TelegramServiceManager:
 
 
 class TelegramService:
-    FEEDBACK_BUTTONS = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("✅ Approve", callback_data="feedback:approve"),
-                InlineKeyboardButton(
-                    "❌ Request Changes", callback_data="feedback:changes"
-                ),
-            ],
-            [
-                InlineKeyboardButton("💬 Comment", callback_data="feedback:comment"),
-            ],
-        ]
-    )
-
     def __init__(
         self,
         bot_token: str,
@@ -114,9 +117,8 @@ class TelegramService:
         self._bot_token = bot_token
         self._admin_chat_id = admin_chat_id
         self._on_feedback_received = on_feedback_received
-        self._application: Application | None = None
+        self._session: aiohttp.ClientSession | None = None
         self._pending_request: PendingFeedbackRequest | None = None
-        self._loop: asyncio.AbstractEventLoop | None = None
         self._poll_task: asyncio.Task | None = None
 
     @property
@@ -129,20 +131,14 @@ class TelegramService:
     def clear_pending_request(self) -> None:
         self._pending_request = None
 
+    # ------------------------------------------------------------------ #
+    # Lifecycle
+    # ------------------------------------------------------------------ #
+
     async def start(self) -> None:
-        if self._application is not None:
+        if self._session is not None:
             return
-
-        self._application = Application.builder().token(self._bot_token).build()
-
-        self._application.add_handler(CommandHandler("start", self._handle_start))
-        self._application.add_handler(CallbackQueryHandler(self._handle_callback))
-        self._application.add_handler(
-            MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_message)
-        )
-
-        await self._application.initialize()
-        await self._application.start()
+        self._session = aiohttp.ClientSession()
         self._poll_task = asyncio.create_task(self._run_polling())
 
     async def stop(self) -> None:
@@ -154,88 +150,159 @@ class TelegramService:
                 pass
             self._poll_task = None
 
-        if self._application is not None:
-            await self._application.stop()
-            await self._application.shutdown()
-            self._application = None
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
+
+    # ------------------------------------------------------------------ #
+    # Low-level HTTP
+    # ------------------------------------------------------------------ #
+
+    async def _call(self, method: str, **kwargs: Any) -> Any:
+        """Call Telegram Bot API via aiohttp. Returns parsed JSON result."""
+        if self._session is None:
+            raise RuntimeError("Session not started")
+        url = TG_API.format(token=self._bot_token, method=method)
+        async with self._session.post(url, json=kwargs) as resp:
+            data = await resp.json()
+            if not data.get("ok"):
+                raise RuntimeError(f"Telegram API error: {data}")
+            return data["result"]
+
+    # ------------------------------------------------------------------ #
+    # Polling
+    # ------------------------------------------------------------------ #
 
     async def _run_polling(self) -> None:
-        if self._application is None:
-            return
-
+        """Long-poll for incoming updates and dispatch them."""
+        offset = None
         try:
-            async with self._application:
-                await self._application.run_polling(
-                    allowed_updates=["message", "callback_query"]
-                )
+            while True:
+                try:
+                    updates = await self._call(
+                        "getUpdates",
+                        offset=offset,
+                        timeout=20,
+                        allowed_updates=["message", "callback_query"],
+                    )
+                    for u in updates:
+                        offset = u["update_id"] + 1
+                        asyncio.create_task(self._dispatch_update(u))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    from ..debug import debug_log
+                    debug_log(f"Telegram polling error: {e}")
+                    await asyncio.sleep(5)
         except asyncio.CancelledError:
             pass
 
-    async def _handle_start(self, update: Update) -> None:
-        if not update.message or str(update.message.chat.id) != self._admin_chat_id:
-            return
+    async def _dispatch_update(self, u: dict) -> None:
+        if "callback_query" in u:
+            await self._handle_callback(u["callback_query"])
+        elif "message" in u:
+            msg = u["message"]
+            text = msg.get("text", "")
+            if text.startswith("/start"):
+                await self._handle_start(msg)
+            else:
+                await self._handle_message(msg)
 
-        await update.message.reply_text(
-            "✅ *Bot Connected!*\n\nI'll notify you when feedback is requested.",
+    # ------------------------------------------------------------------ #
+    # Handlers
+    # ------------------------------------------------------------------ #
+
+    async def _handle_start(self, msg: dict) -> None:
+        if str(msg["chat"]["id"]) != self._admin_chat_id:
+            return
+        await self._call(
+            "sendMessage",
+            chat_id=self._admin_chat_id,
+            text="✅ *Bot Connected!*\n\nI'll notify you when feedback is requested.",
             parse_mode="Markdown",
         )
 
-    async def _handle_callback(self, update: Update) -> None:
-        query = update.callback_query
-        if query is None:
+    async def _handle_callback(self, query: dict) -> None:
+        chat_id = str(query["message"]["chat"]["id"])
+        if chat_id != self._admin_chat_id:
+            await self._call("answerCallbackQuery", callback_query_id=query["id"], text="Unauthorized")
             return
 
-        if str(query.message.chat.id) != self._admin_chat_id:
-            await query.answer("Unauthorized", show_alert=False)
-            return
+        await self._call("answerCallbackQuery", callback_query_id=query["id"])
 
-        await query.answer()
-
-        data = query.data or ""
+        data = query.get("data", "")
         if not data.startswith("feedback:"):
             return
 
         feedback_type = data.split(":", 1)[1]
-        feedback_text = self._get_feedback_text(feedback_type)
+        
+        if feedback_type == "wait":
+            await self._call(
+                "editMessageText",
+                chat_id=chat_id,
+                message_id=query["message"]["message_id"],
+                text="⏳ *Waiting for manual text response...*\n\nPlease type your reply in the chat.",
+                parse_mode="Markdown",
+            )
+            return
+
+        feedback_map = {
+            "continue": "Looks good, please continue.",
+            "skip": "Skip this step.",
+            "retry": "Please try again.",
+        }
+        feedback_text = feedback_map.get(feedback_type, "")
 
         if feedback_text and self._on_feedback_received:
-            self._on_feedback_received(feedback_text)
-            await query.message.edit_text(
-                "✅ *Feedback Received!*\n\nYour feedback has been submitted.",
+            res = self._on_feedback_received(feedback_text)
+            if inspect.isawaitable(res):
+                await res
+            await self._call(
+                "editMessageText",
+                chat_id=chat_id,
+                message_id=query["message"]["message_id"],
+                text="✅ *Feedback Submitted!*\n\n" + feedback_text,
                 parse_mode="Markdown",
             )
+            self.clear_pending_request()
         else:
-            await query.message.edit_text(
-                "⚠️ No active feedback request.",
+            await self._call(
+                "editMessageText",
+                chat_id=chat_id,
+                message_id=query["message"]["message_id"],
+                text="⚠️ No active feedback request.",
                 parse_mode="Markdown",
             )
 
-    async def _handle_message(self, update: Update) -> None:
-        if not update.message or str(update.message.chat.id) != self._admin_chat_id:
+    async def _handle_message(self, msg: dict) -> None:
+        if str(msg["chat"]["id"]) != self._admin_chat_id:
             return
 
         if self._pending_request is None:
-            await update.message.reply_text(
-                "⚠️ No active feedback request to respond to.",
+            await self._call(
+                "sendMessage",
+                chat_id=self._admin_chat_id,
+                text="⚠️ No active feedback request to respond to.",
                 parse_mode="Markdown",
             )
             return
 
-        feedback_text = update.message.text
+        feedback_text = msg.get("text", "")
         if feedback_text and self._on_feedback_received:
-            self._on_feedback_received(feedback_text)
-            await update.message.reply_text(
-                "✅ *Feedback Received!*\n\nYour feedback has been submitted.",
+            res = self._on_feedback_received(feedback_text)
+            if inspect.isawaitable(res):
+                await res
+            await self._call(
+                "sendMessage",
+                chat_id=self._admin_chat_id,
+                text=f"✅ *Feedback Submitted!*\n\n{feedback_text}",
                 parse_mode="Markdown",
             )
             self.clear_pending_request()
 
-    def _get_feedback_text(self, feedback_type: str) -> str:
-        feedback_map = {
-            "approve": "✅ Approved",
-            "changes": "❌ Requested changes",
-        }
-        return feedback_map.get(feedback_type, "")
+    # ------------------------------------------------------------------ #
+    # Public API
+    # ------------------------------------------------------------------ #
 
     async def send_feedback_request(
         self,
@@ -243,45 +310,82 @@ class TelegramService:
         summary: str,
         timeout_seconds: int,
     ) -> bool:
-        if self._application is None:
+        if self._session is None:
             return False
 
-        expires_at = datetime.now(UTC).replace(tzinfo=None) + __import__(
-            "datetime"
-        ).timedelta(seconds=timeout_seconds)
-        expires_time = expires_at.strftime("%I:%M %p")
+        import datetime as dt
+        now = dt.datetime.now(dt.UTC)
+        expires_at_aware = now + dt.timedelta(seconds=timeout_seconds)
+        expires_at = expires_at_aware.replace(tzinfo=None)
 
-        message_text = (
-            "🤖 *Feedback Request*\n\n"
-            f"📁 *Project:* `{project_directory}`\n\n"
-            f"📝 *Summary:*\n{summary}\n\n"
-            f"⏱️ *Expires at {expires_time}*\n\n"
-            "Reply with your feedback or tap a button above."
-        )
+        def _build_message(remaining_seconds: int) -> str:
+            mins = remaining_seconds // 60
+            secs = remaining_seconds % 60
+            expire_str = expires_at_aware.astimezone().strftime("%H:%M:%S")
+            timer_line = f"⏳ *{mins}m {secs:02d}s remaining* — expires at {expire_str}"
+            return f"{summary}\n\n{timer_line}"
 
         try:
-            sent_message = await self._application.bot.send_message(
+            result = await self._call(
+                "sendMessage",
                 chat_id=self._admin_chat_id,
-                text=message_text,
+                text=_build_message(timeout_seconds),
                 parse_mode="Markdown",
-                reply_markup=self.FEEDBACK_BUTTONS,
+                reply_markup=FEEDBACK_BUTTONS,
             )
+            msg_id = result["message_id"]
             self._pending_request = PendingFeedbackRequest(
                 project_directory=project_directory,
                 summary=summary,
                 expires_at=expires_at,
-                message_id=sent_message.message_id,
+                message_id=msg_id,
+            )
+
+            # Live countdown updater
+            asyncio.create_task(
+                self._run_countdown_updater(
+                    message_id=msg_id,
+                    timeout_seconds=timeout_seconds,
+                    build_message=_build_message,
+                )
             )
             return True
-        except Exception:
+        except Exception as e:
+            from ..debug import debug_log
+            debug_log(f"Telegram send_feedback_request failed: {e}")
             return False
+
+    async def _run_countdown_updater(
+        self,
+        message_id: int,
+        timeout_seconds: int,
+        build_message: Callable[[int], str],
+        interval: int = 30,
+    ) -> None:
+        """Edit the message every `interval` seconds to show live countdown."""
+        elapsed = 0
+        while elapsed < timeout_seconds:
+            await asyncio.sleep(interval)
+            elapsed += interval
+            if self._pending_request is None:
+                return
+            remaining = max(0, timeout_seconds - elapsed)
+            try:
+                await self._call(
+                    "editMessageText",
+                    chat_id=self._admin_chat_id,
+                    message_id=message_id,
+                    text=build_message(remaining),
+                    parse_mode="Markdown",
+                    reply_markup=FEEDBACK_BUTTONS,
+                )
+            except Exception:
+                return
 
     async def send_confirmation(self, feedback: str) -> bool:
-        if self._application is None:
-            return False
-
         try:
-            await self._application.bot.send_message(
+            await self._call(
+                "sendMessage",
                 chat_id=self._admin_chat_id,
                 text=f"✅ *Feedback Received!*\n\n{feedback}",
                 parse_mode="Markdown",
@@ -291,11 +395,9 @@ class TelegramService:
             return False
 
     async def send_timeout_notification(self) -> bool:
-        if self._application is None:
-            return False
-
         try:
-            await self._application.bot.send_message(
+            await self._call(
+                "sendMessage",
                 chat_id=self._admin_chat_id,
                 text="⌛ *Feedback Timed Out*\n\nNo feedback was received within the timeout period.",
                 parse_mode="Markdown",
@@ -305,11 +407,9 @@ class TelegramService:
             return False
 
     async def send_custom_message(self, text: str) -> bool:
-        if self._application is None:
-            return False
-
         try:
-            await self._application.bot.send_message(
+            await self._call(
+                "sendMessage",
                 chat_id=self._admin_chat_id,
                 text=text,
                 parse_mode="Markdown",

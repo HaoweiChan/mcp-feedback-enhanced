@@ -468,21 +468,36 @@ async def interactive_feedback(
         # 發送 Telegram 通知（在等待反饋之前）
         try:
             from .services import TelegramServiceManager
+            _telegram_debug_log = debug_log  # reuse the already-imported debug_log
+            
+            async def handle_telegram_feedback(text: str):
+                try:
+                    from .web.main import get_web_ui_manager
+                    manager = get_web_ui_manager()
+                    if manager.current_session:
+                        _telegram_debug_log(f"Telegram回饋已轉發至會話 {manager.current_session.session_id}")
+                        await manager.current_session.submit_feedback(feedback=text, images=[])
+                    else:
+                        _telegram_debug_log("收到 Telegram 回饋，但沒有活躍的 Web 會話")
+                except Exception as e:
+                    _telegram_debug_log(f"處理 Telegram 回饋時發生錯誤: {e}")
 
             telegram_manager = await TelegramServiceManager.get_instance()
+            _telegram_debug_log(f"Telegram 啟用狀態: {telegram_manager.is_enabled}")
             if telegram_manager.is_enabled:
-                # 啟動 Telegram 服務（如果尚未啟動）
-                service = await telegram_manager.start_service()
+                service = await telegram_manager.start_service(on_feedback_received=handle_telegram_feedback)
                 if service:
-                    # 發送反饋請求通知
-                    debug_log("發送 Telegram 反饋請求通知")
-                    asyncio.create_task(
-                        service.send_feedback_request(
-                            project_directory, summary, timeout
-                        )
+                    _telegram_debug_log(f"發送 Telegram 反饋請求通知至 Chat ID: {service._admin_chat_id}")
+                    success = await service.send_feedback_request(
+                        project_directory, summary, timeout
                     )
+                    _telegram_debug_log(f"Telegram 通知發送結果: {'成功' if success else '失敗'}")
+                else:
+                    _telegram_debug_log("Telegram 服務啟動失敗或未返回實例")
         except Exception as e:
-            debug_log(f"Telegram 通知發送失敗: {e}")
+            import traceback
+            debug_log(f"Telegram 通知過程發生異常: {e}")
+            debug_log(traceback.format_exc())
 
         result = await launch_web_feedback_ui(project_directory, summary, timeout)
 
